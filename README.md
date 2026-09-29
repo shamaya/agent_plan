@@ -2,6 +2,8 @@
 
 一个开源的 LLM Agent 工程化平台，提供 Skill 管理、MCP 工具集成、知识库、可观测性、上下文压缩等工程能力，帮助开发者快速构建和运维 Agent 应用。
 
+**NOTICE**: 该平台为实验性版本，不建议在生产环境中使用，相关功能可能不完善。
+
 ## 核心功能
 
 | 模块 | 功能 |
@@ -29,8 +31,8 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/yourname/agent-platform.git
-cd agent-platform
+git clone https://github.com/shamaya/agent_plan.git
+cd agent_plan
 
 # 2. 复制环境配置
 cp .env.example .env
