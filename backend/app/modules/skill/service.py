@@ -217,7 +217,7 @@ async def test_skill(session: Session, skill_id: int, parameters: dict,
     result = {"ok": True, "rendered_prompt": rendered}
     if model_id:
         from app.modules.provider.service import get_active_model
-        from app.llm.client import chat_completion
+        from app.llm.client import build_client
         active = get_active_model(session, model_id)
         if not active:
             result["error"] = "model 不可用"
@@ -228,8 +228,11 @@ async def test_skill(session: Session, skill_id: int, parameters: dict,
                 {"role": "system", "content": s.description or "你是一个助手"},
                 {"role": "user", "content": rendered},
             ]
-            resp = await chat_completion(config, model_name, messages, max_tokens=max_tokens)
-            result["llm_response"] = resp.get("content", "") if isinstance(resp, dict) else str(resp)
+            client = build_client(config)
+            resp = await client.chat.completions.create(
+                model=model_name, messages=messages, max_tokens=max_tokens or 4096,
+            )
+            result["llm_response"] = resp.choices[0].message.content or ""
         except Exception as e:
             result["error"] = f"LLM 调用失败: {e}"
     return result
