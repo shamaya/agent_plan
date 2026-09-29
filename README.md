@@ -76,7 +76,7 @@ npm run dev    # http://localhost:5173
 ## 项目结构
 
 ```
-agent-platform/
+agent-plan/
 ├── backend/
 │   └── app/
 │       ├── core/           # 配置、日志、生命周期
