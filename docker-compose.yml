@@ -1,0 +1,19 @@
+services:
+  agent-platform:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: agent-platform
+    ports:
+      - "8080:80"
+    volumes:
+      - agent-data:/app/data
+    environment:
+      - AGENT_MASTER_KEY=${AGENT_MASTER_KEY:-change-me-please}
+      - DATA_DIR=/app/data
+      - DEFAULT_EMBEDDING=${DEFAULT_EMBEDDING:-local}
+      - LOCAL_EMBEDDING_MODEL=${LOCAL_EMBEDDING_MODEL:-paraphrase-multilingual-MiniLM-L12-v2}
+    restart: unless-stopped
+
+volumes:
+  agent-data:

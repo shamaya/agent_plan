@@ -1,0 +1,36 @@
+# 运行时数据
+data/
+backend/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+hf_cache/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# 构建产物
+*.log
+
+# IDE / Trae
+.trae/
+.vscode/
+.idea/
+
+# 环境配置
+.env
+
+# Docker 持久卷
+*.sqlite*
+chroma/
+
+# 测试脚本
+backend/test_api.py
+frontend/check_*.cjs
+frontend/extract*.cjs
+nginx.conf.bak

@@ -1,0 +1,9 @@
+[project]
+name = "agent-platform"
+version = "0.1.0"
+description = "Agent 开发平台 - 参考灵一 AgentOne，含 Skill/MCP/知识库/监控/Harness 工程层/上下文压缩"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

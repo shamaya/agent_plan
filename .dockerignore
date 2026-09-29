@@ -1,0 +1,25 @@
+# 前端依赖与产物（构建阶段重新安装/生成）
+frontend/node_modules
+frontend/dist
+
+# 运行时数据卷
+data/
+backend/data/
+
+# Python 缓存
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+.venv
+venv
+
+# 构建上下文瘦身
+.git
+.trae
+.vscode
+.idea
+**/*.log
+**/.env
+
+# 文档
+*.md

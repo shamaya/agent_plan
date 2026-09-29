@@ -1,0 +1,28 @@
+# ===== Web 框架 =====
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20        # 文件上传
+
+# ===== ORM / 数据 =====
+sqlmodel==0.0.22
+pydantic==2.10.4
+
+# ===== LLM / Embedding =====
+openai==1.59.7                   # OpenAI 兼容客户端（含 Ollama/vLLM）
+tiktoken==0.8.0                  # token 估算（压缩触发）
+sentence-transformers==3.3.1     # 本地 embedding 兜底
+chromadb==0.5.23                 # 嵌入式向量库
+
+# ===== MCP =====
+mcp==1.2.0                       # 官方 MCP Python SDK
+
+# ===== 文档解析 =====
+pypdf==5.1.0
+markdown==3.7
+
+# ===== 安全 / 加密 =====
+cryptography==44.0.0            # Fernet 加密 provider key
+
+# ===== 工具 =====
+httpx==0.28.1                    # 异步 HTTP（MCP SSE/HTTP transport、provider 测试）
+# SSE 响应改用 fastapi.responses.StreamingResponse，不再需要 sse-starlette
