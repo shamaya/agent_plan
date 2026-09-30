@@ -56,6 +56,11 @@ def create_app():
     from app.modules.trace.router import router as trace_router
     from app.modules.apikey.router import router as apikey_router
     from app.modules.openapi.router import router as openapi_router
+    from app.modules.a2a.router import router as a2a_router
+    from app.modules.workflow.router import router as workflow_router
+    from app.modules.evaluation.router import router as evaluation_router
+    from app.modules.guardrail.router import router as guardrail_router
+    from app.modules.prompt_template.router import router as prompt_template_router
 
     app.include_router(provider_router, prefix="/api")
     app.include_router(skill_router, prefix="/api")
@@ -67,6 +72,17 @@ def create_app():
     app.include_router(apikey_router, prefix="/api")
     # 开放 API：第三方接入，认证用 X-API-Key（不走前端 X-Master-Key）
     app.include_router(openapi_router, prefix="/api/v1")
+    # A2A Protocol：Agent2Agent 互操作（Agent Card + 任务接入）
+    # 用 /api/a2a 前缀以便复用 nginx /api/ 转发规则
+    app.include_router(a2a_router, prefix="/api/a2a")
+    # DAG 工作流：多 Agent 编排
+    app.include_router(workflow_router, prefix="/api")
+    # 评估框架：LLM-as-Judge
+    app.include_router(evaluation_router, prefix="/api")
+    # Guardrail：输出校验 + 重试
+    app.include_router(guardrail_router, prefix="/api")
+    # Prompt 模板市场 + 缓存
+    app.include_router(prompt_template_router, prefix="/api")
 
     @app.get("/api/health")
     async def health():

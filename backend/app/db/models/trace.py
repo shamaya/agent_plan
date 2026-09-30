@@ -29,6 +29,7 @@ class Message(SQLModel, table=True):
     conversation_id: int = Field(foreign_key="conversations.id", index=True)
     role: str  # system | user | assistant | tool
     content: str = ""
+    images: list = Field(default_factory=list, sa_column=Column(JSON))  # 多模态：图片 URL 列表
     tool_calls: list = Field(default_factory=list, sa_column=Column(JSON))
     tool_results: list = Field(default_factory=list, sa_column=Column(JSON))
     token_count: int = 0

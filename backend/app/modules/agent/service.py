@@ -7,11 +7,12 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from app.core.logging import logger
-from app.db.models import Agent, Conversation, Message, AgentVersion, Skill, McpServer, KnowledgeBase, Model, ConstraintProfile
+from app.db.models import Agent, Conversation, Message, AgentVersion, AgentWorker, Skill, McpServer, KnowledgeBase, Model, ConstraintProfile
 from app.modules.agent.schemas import (
     AgentCreate, AgentUpdate, AgentRead,
     ConversationRead, MessageRead,
     AgentVersionRead, AgentExport,
+    AgentWorkerCreate, AgentWorkerRead,
 )
 
 
@@ -30,6 +31,11 @@ def _agent_to_read(a: Agent, session: Session | None = None) -> AgentRead:
         mcp_server_ids=a.mcp_server_ids or [], kb_ids=a.kb_ids or [],
         constraint_profile_id=a.constraint_profile_id,
         context_config=a.context_config or {}, version=version,
+        approval_config=a.approval_config or {"enabled": False, "tools": []},
+        routing_config=a.routing_config or {
+            "enabled": False, "simple_model_id": None,
+            "complex_model_id": None, "threshold": 0.5,
+        },
         created_at=a.created_at,
     )
 
@@ -51,6 +57,8 @@ def create_agent(session: Session, data: AgentCreate) -> AgentRead:
         mcp_server_ids=data.mcp_server_ids, kb_ids=data.kb_ids,
         constraint_profile_id=data.constraint_profile_id,
         context_config=data.context_config,
+        approval_config=data.approval_config,
+        routing_config=data.routing_config,
     )
     session.add(a)
     session.commit()
@@ -80,6 +88,10 @@ def update_agent(session: Session, agent_id: int, data: AgentUpdate) -> Optional
         a.constraint_profile_id = data.constraint_profile_id
     if data.context_config is not None:
         a.context_config = data.context_config
+    if data.approval_config is not None:
+        a.approval_config = data.approval_config
+    if data.routing_config is not None:
+        a.routing_config = data.routing_config
     session.add(a)
     session.commit()
     session.refresh(a)
@@ -120,6 +132,11 @@ def _save_version(session: Session, agent_id: int, note: str = "") -> AgentVersi
         "mcp_server_ids": a.mcp_server_ids or [], "kb_ids": a.kb_ids or [],
         "constraint_profile_id": a.constraint_profile_id,
         "context_config": a.context_config or {},
+        "approval_config": a.approval_config or {"enabled": False, "tools": []},
+        "routing_config": a.routing_config or {
+            "enabled": False, "simple_model_id": None,
+            "complex_model_id": None, "threshold": 0.5,
+        },
     }
     v = AgentVersion(agent_id=agent_id, version=next_ver, snapshot=snap, note=note)
     session.add(v)
@@ -167,6 +184,11 @@ def rollback_version(session: Session, agent_id: int, version_id: int) -> Option
     a.kb_ids = snap.get("kb_ids", [])
     a.constraint_profile_id = snap.get("constraint_profile_id")
     a.context_config = snap.get("context_config", {})
+    a.approval_config = snap.get("approval_config", {"enabled": False, "tools": []})
+    a.routing_config = snap.get("routing_config", {
+        "enabled": False, "simple_model_id": None,
+        "complex_model_id": None, "threshold": 0.5,
+    })
     session.add(a)
     session.commit()
     session.refresh(a)
@@ -299,7 +321,8 @@ def list_messages(session: Session, conv_id: int) -> list[MessageRead]:
     ).all()
     return [MessageRead(
         id=m.id, conversation_id=m.conversation_id, role=m.role,
-        content=m.content or "", tool_calls=m.tool_calls or [],
+        content=m.content or "", images=m.images or [],
+        tool_calls=m.tool_calls or [],
         tool_results=m.tool_results or [], token_count=m.token_count,
         is_compressed_summary=m.is_compressed_summary, created_at=m.created_at,
     ) for m in rows]
@@ -320,4 +343,65 @@ def delete_conversation(session: Session, conv_id: int) -> bool:
     session.delete(c)
     session.commit()
     logger.info(f"删除对话 id={conv_id}")
+    return True
+
+
+# ===== 多智能体协同（Worker 池管理）=====
+def list_workers(session: Session, supervisor_id: int) -> list[AgentWorkerRead]:
+    """列出 Supervisor 的 Worker 池。"""
+    rows = session.exec(
+        select(AgentWorker).where(AgentWorker.supervisor_id == supervisor_id)
+        .order_by(AgentWorker.sort_order)
+    ).all()
+    result = []
+    for w in rows:
+        a = session.get(Agent, w.worker_id)
+        result.append(AgentWorkerRead(
+            id=w.id, supervisor_id=w.supervisor_id, worker_id=w.worker_id,
+            worker_name=a.name if a else f"Agent#{w.worker_id}",
+            role_description=w.role_description, sort_order=w.sort_order,
+            created_at=w.created_at,
+        ))
+    return result
+
+
+def add_worker(session: Session, supervisor_id: int, data: AgentWorkerCreate) -> AgentWorkerRead:
+    """添加 Worker 到 Supervisor 的 Worker 池。"""
+    # 防止自引用
+    if data.worker_id == supervisor_id:
+        raise ValueError("不能将自己添加为 Worker")
+    # 防止重复
+    existing = session.exec(
+        select(AgentWorker).where(
+            AgentWorker.supervisor_id == supervisor_id,
+            AgentWorker.worker_id == data.worker_id,
+        )
+    ).first()
+    if existing:
+        raise ValueError("该 Worker 已存在于 Worker 池中")
+    w = AgentWorker(
+        supervisor_id=supervisor_id, worker_id=data.worker_id,
+        role_description=data.role_description, sort_order=data.sort_order,
+    )
+    session.add(w)
+    session.commit()
+    session.refresh(w)
+    a = session.get(Agent, w.worker_id)
+    logger.info(f"agent id={supervisor_id} 添加 worker id={w.worker_id}")
+    return AgentWorkerRead(
+        id=w.id, supervisor_id=w.supervisor_id, worker_id=w.worker_id,
+        worker_name=a.name if a else f"Agent#{w.worker_id}",
+        role_description=w.role_description, sort_order=w.sort_order,
+        created_at=w.created_at,
+    )
+
+
+def remove_worker(session: Session, supervisor_id: int, worker_row_id: int) -> bool:
+    """从 Worker 池移除一个 Worker 关联。"""
+    w = session.get(AgentWorker, worker_row_id)
+    if not w or w.supervisor_id != supervisor_id:
+        return False
+    session.delete(w)
+    session.commit()
+    logger.info(f"agent id={supervisor_id} 移除 worker row id={worker_row_id}")
     return True

@@ -16,7 +16,7 @@ from typing import Any
 from sqlmodel import Session, select
 
 from app.core.logging import logger
-from app.db.models import Agent, Skill, McpTool, ConstraintProfile
+from app.db.models import Agent, Skill, McpTool, ConstraintProfile, AgentWorker
 from app.modules.harness.constraints import get_profile_constraints
 from app.modules.harness import recovery as recovery_mod
 from app.modules.mcp.registry import list_tools_by_ids
@@ -119,15 +119,96 @@ def _build_rag_context(agent: Agent, user_msg: str, session: Session) -> str:
     return "\n".join(lines)
 
 
+def _build_delegation_manifest(agent: Agent, session: Session) -> str:
+    """构建委托清单注入 system prompt。
+
+    - Managed 模式（有 Worker 池）：仅注入配置的 Worker + 角色描述
+    - Auto 模式（无 Worker 池）：注入所有其他 Agent
+    """
+    workers = session.exec(
+        select(AgentWorker).where(AgentWorker.supervisor_id == agent.id)
+        .order_by(AgentWorker.sort_order)
+    ).all()
+    lines = []
+    if workers:
+        # Managed 模式
+        lines.append("\n\n## 可委托的 Worker（通过 assign_task(worker_id, task) 调用）")
+        for w in workers:
+            a = session.get(Agent, w.worker_id)
+            name = a.name if a else f"Agent#{w.worker_id}"
+            desc = w.role_description or (a.description if a and hasattr(a, 'description') else "")
+            lines.append(f"- worker_id={w.worker_id}（{name}）: {desc}")
+    else:
+        # Auto 模式
+        all_agents = session.exec(
+            select(Agent).where(Agent.id != agent.id).order_by(Agent.id)
+        ).all()
+        if all_agents:
+            lines.append("\n\n## 可委托的 Agent（通过 delegate(agent_name, task) 调用）")
+            for a in all_agents:
+                lines.append(f"- {a.name}（id={a.id}）")
+    return "\n".join(lines)
+
+
+def _delegation_tools_schema(managed: bool) -> list[dict]:
+    """返回委托工具的 OpenAI tools schema。"""
+    if managed:
+        return [{
+            "type": "function",
+            "function": {
+                "name": "assign_task",
+                "description": "委托任务给指定的 Worker Agent 执行，等待其完成后返回结果。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "worker_id": {"type": "integer", "description": "Worker Agent 的 ID"},
+                        "task": {"type": "string", "description": "要委托的任务描述"},
+                    },
+                    "required": ["worker_id", "task"],
+                },
+            },
+        }]
+    else:
+        return [{
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "description": "委托任务给指定的 Agent 执行，等待其完成后返回结果。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": {"type": "string", "description": "目标 Agent 的名称"},
+                        "task": {"type": "string", "description": "要委托的任务描述"},
+                    },
+                    "required": ["agent_name", "task"],
+                },
+            },
+        }]
+
+
+def _multimodal_content(text: str, images: list[str] | None) -> str | list[dict]:
+    """构造多模态消息 content：有图片时返回 parts 列表，否则返回纯文本字符串。"""
+    if not images:
+        return text
+    parts: list[dict] = [{"type": "text", "text": text}]
+    for url in images:
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
+
+
 def build(agent: Agent, history: list[dict], user_msg: str, session: Session,
-          constraints: dict, conv_id: int | None = None) -> tuple[list[dict], list[dict]]:
+          constraints: dict, conv_id: int | None = None,
+          images: list[str] | None = None) -> tuple[list[dict], list[dict]]:
     """组装完整上下文。返回 (messages, tools)。
 
-    history: 活跃历史消息（已被压缩裁剪过），格式 [{role, content, tool_calls?, tool_results?}]
+    history: 活跃历史消息（已被压缩裁剪过），格式 [{role, content, tool_calls?, tool_results?, images?}]
     user_msg: 当前用户输入
+    images: 当前用户输入附带的图片 URL 列表（多模态）
     """
     # 1. system prompt + skill 描述
     system_text = _build_system_prompt(agent, session)
+    # 1.5 委托清单（多智能体协同）
+    system_text += _build_delegation_manifest(agent, session)
     # 2. 约束声明
     system_text += _build_constraint_declaration(constraints)
     # 3. recovery advice
@@ -147,7 +228,7 @@ def build(agent: Agent, history: list[dict], user_msg: str, session: Session,
     # 5. 压缩历史 + 近 N 轮（history 已由 compressor 裁剪）
     for m in history:
         role = m["role"]
-        msg: dict[str, Any] = {"role": role, "content": m.get("content", "")}
+        msg: dict[str, Any] = {"role": role, "content": _multimodal_content(m.get("content", ""), m.get("images"))}
         # assistant 的 tool_calls：DB 存简化格式 → OpenAI 标准 {id, type:function, function:{name, arguments(字符串)}}
         if role == "assistant" and m.get("tool_calls"):
             msg["tool_calls"] = [
@@ -170,12 +251,17 @@ def build(agent: Agent, history: list[dict], user_msg: str, session: Session,
             msg["tool_call_id"] = m.get("tool_call_id") or ""
             msg["name"] = m.get("name", "")
         messages.append(msg)
-    # 当前 user_msg
-    messages.append({"role": "user", "content": user_msg})
+    # 当前 user_msg（支持多模态图片）
+    messages.append({"role": "user", "content": _multimodal_content(user_msg, images)})
 
     # 6. tools
     tools = discover_tools(agent, session, constraints.get("allowed_tools", ["*"]),
                             constraints.get("forbidden_actions", []))
+    # 6.1 委托工具（多智能体协同）
+    has_workers = session.exec(
+        select(AgentWorker).where(AgentWorker.supervisor_id == agent.id)
+    ).first()
+    tools += _delegation_tools_schema(managed=bool(has_workers))
     # recovery: disable_tool 规则剔除工具
     if rules:
         tools = recovery_mod.disable_tools(rules, tools)

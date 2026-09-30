@@ -12,27 +12,32 @@ LLM 自主决定工具/方法/任务规划，框架只负责约束 + 压缩 + �
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import AsyncIterator, Optional
 
 from sqlmodel import Session, select
 
 from app.core.logging import logger
-from app.db.models import Agent, Conversation, Message, Trace, ConstraintProfile, McpServer, McpTool
+from app.db.models import Agent, Conversation, Message, Trace, ConstraintProfile, McpServer, McpTool, AgentWorker
 from app.llm.stream import (
     sse_event, token_event, tool_call_event, tool_result_event,
     compression_event, trace_step_event, done_event, error_event,
+    approval_request_event, routing_event,
 )
 from app.modules.harness import constraints, budgets, recovery
 from app.modules.harness.constraints import get_profile_constraints
 from app.modules.agent import context_builder, runner, compressor
+from app.modules.agent.approval import approval_manager
+from app.modules.agent.memory import build_memory_context, extract_memories
+from app.modules.agent.routing import route_for_agent
 from app.modules.provider.service import get_active_model
 from app.utils.tokens import count_tokens, count_messages_tokens
 from app.utils.security import detect_prompt_injection, mask_sensitive_obj
 
 
 async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
-                    session: Session) -> AsyncIterator[str]:
+                    session: Session, images: list[str] | None = None) -> AsyncIterator[str]:
     """运行 agent，yield SSE 事件字符串。"""
     # 1. 取激活 model + provider config
     if not agent.model_id:
@@ -66,9 +71,10 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
     # 3. 加载历史消息（排除已被压缩剔除的，但含压缩摘要消息）
     history = _load_history(session, conv.id)
 
-    # 4. 写 user 消息到 DB
+    # 4. 写 user 消息到 DB（含多模态图片）
     user_msg_row = Message(
         conversation_id=conv.id, role="user", content=user_msg,
+        images=images or [],
         token_count=count_tokens(user_msg),
     )
     session.add(user_msg_row)
@@ -76,6 +82,7 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
     session.refresh(user_msg_row)
     history.append({
         "id": user_msg_row.id, "role": "user", "content": user_msg,
+        "images": images or [],
     })
 
     # 4.5 Prompt 注入检测（启发式，仅记录不拦截）
@@ -96,6 +103,7 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
     tools_tokens = budgets.estimate_tools_tokens(tools_preview)
 
     # 5. 主循环
+    guardrail_retries: dict[int, int] = {}  # rule_id -> 已重试次数
     for iteration in range(cons["max_iterations"]):
         # 5a. 迭代上限检查
         ok, reason = constraints.check_iterations(iteration, cons["max_iterations"])
@@ -124,10 +132,51 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
             )
             # compression trace 已由 compressor.maybe_compress 内部写入，这里不重复
 
-        # 5d. 组装上下文
+        # 5d. 组装上下文（首轮传入 images，后续轮次历史已含）
+        cur_images = images if iteration == 0 else None
         messages, tools = context_builder.build(
-            agent, history, user_msg, session, cons, conv.id
+            agent, history, user_msg, session, cons, conv.id, cur_images
         )
+        # 注入长期记忆（跨会话）
+        memory_ctx = build_memory_context(session, agent.id, user_msg)
+        if memory_ctx and messages and messages[0]["role"] == "system":
+            if "长期记忆" not in (messages[0].get("content") or ""):
+                messages[0]["content"] += memory_ctx
+
+        # 5d-bis. 智能路由：根据复杂度切换 model
+        routing_decision = route_for_agent(agent, user_msg, history, iteration)
+        if routing_decision["enabled"]:
+            sel_model_id = routing_decision["selected_model_id"]
+            if sel_model_id is not None and sel_model_id != agent.model_id:
+                # 切换到路由选中的 model（重新取 provider config + 模型元数据）
+                routed_active = get_active_model(session, sel_model_id)
+                if routed_active:
+                    config, model_name, ctx_window, max_tokens = routed_active
+                    # 同步更新 ctx_window / max_tokens 给后续 compressor 使用
+                    # 注意：cons["token_budget"] 不在此处调整，避免误触发压缩
+                else:
+                    logger.warning(
+                        f"路由选中 model_id={sel_model_id} 不可用，回退到默认 model"
+                    )
+                    routing_decision["label"] = routing_decision["label"] + "_unavailable"
+            # 推送路由决策给前端 + 写 trace
+            yield routing_event(
+                routing_decision["complexity"],
+                routing_decision["label"],
+                routing_decision["selected_model_id"],
+                routing_decision["reason"],
+                routing_decision["signals"],
+            )
+            _write_trace(session, conv.id, agent.id, iteration, "routing",
+                         input={"user_msg": user_msg[:200], "iteration": iteration},
+                         output={
+                             "complexity": routing_decision["complexity"],
+                             "label": routing_decision["label"],
+                             "selected_model_id": routing_decision["selected_model_id"],
+                             "reason": routing_decision["reason"],
+                             "signals": routing_decision["signals"],
+                         },
+                         status="ok")
 
         # 5e. 调 LLM（流式）
         full_content = ""
@@ -173,6 +222,33 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
                 tool_name = tc["name"]
                 tool_args = tc["arguments"]
 
+                # ===== 委托拦截：delegate / assign_task =====
+                if tool_name in ("delegate", "assign_task"):
+                    result = await _handle_delegation(
+                        tool_name, tool_args, agent, conv, session, config, model_name
+                    )
+                    yield tool_result_event(tool_name, result)
+                    _write_trace(session, conv.id, agent.id, iteration, "tool_call",
+                                 tool_name=tool_name, input=tool_args,
+                                 output={"result": str(result)[:500]},
+                                 status="ok")
+                    # 写 DB
+                    db_msg = Message(
+                        conversation_id=conv.id, role="tool",
+                        content=str(result),
+                        tool_results=[{"name": tool_name, "result": result, "tool_call_id": tc.get("id", "")}],
+                        token_count=count_tokens(str(result)),
+                    )
+                    session.add(db_msg)
+                    session.commit()
+                    session.refresh(db_msg)
+                    history.append({
+                        "id": db_msg.id, "role": "tool", "content": str(result),
+                        "tool_results": [{"name": tool_name, "result": result}],
+                        "name": tool_name, "tool_call_id": tc.get("id", ""),
+                    })
+                    continue
+
                 # 工具白名单校验
                 ok, reason = constraints.allow_tool(
                     tool_name, cons.get("allowed_tools", ["*"]),
@@ -186,6 +262,41 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
                     continue
 
                 yield tool_call_event(tool_name, tool_args)
+
+                # ===== HITL 审批检查 =====
+                approval_cfg = agent.approval_config or {}
+                if approval_cfg.get("enabled") and tool_name in (approval_cfg.get("tools") or []):
+                    import uuid
+                    approval_id = str(uuid.uuid4())[:8]
+                    pa = approval_manager.create(approval_id, conv.id, tool_name, tool_args)
+                    logger.info(f"HITL 审批请求: approval_id={approval_id} tool={tool_name} conv={conv.id}")
+                    yield approval_request_event(approval_id, tool_name, tool_args)
+                    # 阻塞等待用户决策
+                    await pa.decision_event.wait()
+                    approval_manager._pending.pop(approval_id, None)
+                    if not pa.approved:
+                        result = {"skipped": True, "reason": pa.reason or "用户拒绝执行"}
+                        yield tool_result_event(tool_name, result)
+                        _write_trace(session, conv.id, agent.id, iteration, "tool_call",
+                                     tool_name=tool_name, input=tool_args,
+                                     output={"result": str(result)[:500]},
+                                     status="ok")
+                        # 写 DB
+                        db_msg = Message(
+                            conversation_id=conv.id, role="tool",
+                            content=str(result),
+                            tool_results=[{"name": tool_name, "result": result, "tool_call_id": tc.get("id", "")}],
+                            token_count=count_tokens(str(result)),
+                        )
+                        session.add(db_msg)
+                        session.commit()
+                        session.refresh(db_msg)
+                        history.append({
+                            "id": db_msg.id, "role": "tool", "content": str(result),
+                            "tool_results": [{"name": tool_name, "result": result}],
+                            "name": tool_name, "tool_call_id": tc.get("id", ""),
+                        })
+                        continue
 
                 # 查 tool 所属 server 配置
                 server_config, transport_type = _find_tool_server(
@@ -241,7 +352,32 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
             # 继续下一轮迭代让 LLM 处理工具结果
             continue
         else:
-            # 无 tool_calls：完成
+            # 无 tool_calls：完成前做 guardrail 校验
+            guardrail_action, feedback = _apply_guardrails(
+                agent, full_content, session, guardrail_retries,
+            )
+            if guardrail_action == "retry":
+                # 把当前回答 + 反馈追加到历史，让 LLM 下一轮修正
+                history.append({
+                    "role": "assistant", "content": full_content,
+                })
+                history.append({
+                    "role": "user", "content": feedback,
+                })
+                yield sse_event("guardrail", {
+                    "action": "retry", "feedback": feedback,
+                })
+                continue
+            elif guardrail_action == "reject":
+                yield error_event("输出未通过校验，已拒绝")
+                return
+            elif guardrail_action == "append_warning":
+                full_content = full_content + "\n\n⚠️ " + feedback
+                yield sse_event("guardrail", {
+                    "action": "append_warning", "feedback": feedback,
+                })
+
+            # 写最终 assistant 消息
             assistant_msg = Message(
                 conversation_id=conv.id, role="assistant",
                 content=full_content,
@@ -252,11 +388,67 @@ async def run_agent(agent: Agent, user_msg: str, conv: Conversation,
             conv.updated_at = datetime.utcnow()
             session.add(conv)
             session.commit()
+            # 异步提取记忆（不阻塞返回）
+            try:
+                conv_messages = [
+                    {"role": m.role, "content": m.content}
+                    for m in history
+                ]
+                await extract_memories(session, agent.id, conv_messages)
+            except Exception as e:
+                logger.warning(f"记忆提取失败（不影响对话）: {e}")
             yield done_event(final=full_content)
             return
 
     # 迭代用尽
     yield done_event(final="已达最大迭代次数")
+
+
+def _apply_guardrails(agent, content, session, retries: dict[int, int]) -> tuple[str, str]:
+    """应用 guardrail 规则。返回 (action, feedback)。
+
+    action: "pass" | "retry" | "reject" | "append_warning"
+    决策逻辑：按 sort_order 依次检查，命中第一条 violation 后：
+      - 若 action=reject 且未超过重试次数 → 降级为 retry（给 LLM 一次修正机会），超过则 reject
+      - 若 action=retry 且未超过 retry_count → retry；超过则 append_warning（保留输出加警告）
+      - 若 action=append_warning → append_warning
+    """
+    from app.modules.guardrail import service as gr_service, engine as gr_engine
+
+    rules = gr_service.get_rules_for_agent(session, agent.id)
+    if not rules:
+        return "pass", ""
+
+    result = gr_engine.check_all(rules, content)
+    if result.passed:
+        return "pass", ""
+
+    # 取第一条违规规则决定动作
+    violations = [r for r in result.results if not r.passed]
+    if not violations:
+        return "pass", ""
+
+    v = violations[0]
+    feedback = gr_engine.build_retry_feedback(violations)
+    rule = next((r for r in rules if r.id == v.rule_id), None)
+    if not rule:
+        return "pass", ""
+
+    tried = retries.get(rule.id, 0)
+    retries[rule.id] = tried + 1
+
+    if rule.action == "reject":
+        if tried < rule.retry_count:
+            return "retry", feedback
+        return "reject", feedback
+    elif rule.action == "retry":
+        if tried < rule.retry_count:
+            return "retry", feedback
+        # 重试耗尽：保留输出并加警告
+        return "append_warning", feedback
+    elif rule.action == "append_warning":
+        return "append_warning", feedback
+    return "pass", ""
 
 
 def _load_history(session: Session, conv_id: int) -> list[dict]:
@@ -285,6 +477,7 @@ def _load_history(session: Session, conv_id: int) -> list[dict]:
                 name = first.get("name") or ""
         history.append({
             "id": m.id, "role": m.role, "content": m.content or "",
+            "images": m.images or [],
             "tool_calls": m.tool_calls or [],
             "tool_results": m.tool_results or [],
             "tool_call_id": tool_call_id,
@@ -349,3 +542,125 @@ def _find_tool_server(session: Session, server_ids: list[int],
         if tools:
             return s.config or {}, s.transport_type
     return None, "stdio"
+
+
+async def _handle_delegation(tool_name: str, tool_args: dict,
+                             supervisor_agent: Agent, conv: Conversation,
+                             session: Session, config, model_name: str) -> dict:
+    """处理委托工具调用：启动子 Agent Loop 并收集结果。
+
+    - delegate（Auto 模式）：按 agent_name 查找目标 Agent
+    - assign_task（Managed 模式）：按 worker_id 查找目标 Agent
+    """
+    if tool_name == "delegate":
+        agent_name = tool_args.get("agent_name", "")
+        task = tool_args.get("task", "")
+        if not agent_name:
+            return {"error": "缺少 agent_name 参数"}
+        target = session.exec(
+            select(Agent).where(Agent.name == agent_name)
+        ).first()
+        if not target:
+            return {"error": f"Agent '{agent_name}' 不存在"}
+    else:  # assign_task
+        worker_id = tool_args.get("worker_id")
+        task = tool_args.get("task", "")
+        if not worker_id:
+            return {"error": "缺少 worker_id 参数"}
+        # 校验 worker 是否在 supervisor 的池中
+        worker_row = session.exec(
+            select(AgentWorker).where(
+                AgentWorker.supervisor_id == supervisor_agent.id,
+                AgentWorker.worker_id == worker_id,
+            )
+        ).first()
+        if not worker_row:
+            return {"error": f"worker_id={worker_id} 不在当前 Agent 的 Worker 池中"}
+        target = session.get(Agent, worker_id)
+        if not target:
+            return {"error": f"Worker Agent id={worker_id} 不存在"}
+
+    if not target.model_id:
+        return {"error": f"目标 Agent '{target.name}' 未配置 model"}
+
+    # 获取目标 Agent 的 model 配置
+    from app.modules.provider.service import get_active_model
+    target_active = get_active_model(session, target.model_id)
+    if not target_active:
+        return {"error": f"目标 Agent '{target.name}' 的 model 不可用"}
+    target_config, target_model_name, _, target_max_tokens = target_active
+
+    # 构建子 Agent 的上下文（复用 context_builder）
+    sub_messages, sub_tools = context_builder.build(
+        target, [], task, session,
+        {"max_iterations": 5, "token_budget": int(target_active[2] * 0.8),
+         "allowed_tools": ["*"], "forbidden_actions": [],
+         "tool_failure_threshold": 3,
+         "compression_policy": {"enabled": False, "trigger_ratio": 0.8, "keep_recent_turns": 4}},
+        conv.id,
+    )
+
+    logger.info(f"委托执行：supervisor={supervisor_agent.name} → worker={target.name} task={task[:100]}")
+
+    # 执行子 Agent Loop（非流式，收集最终结果）
+    sub_content = ""
+    try:
+        async for event in runner.call_llm(target_config, target_model_name, sub_messages, sub_tools):
+            etype = event.get("type")
+            if etype == "token":
+                sub_content += event["text"]
+            elif etype == "done":
+                if not sub_content:
+                    sub_content = event.get("content", "")
+                break
+            elif etype == "error":
+                return {"error": f"子 Agent 执行失败: {event['message']}"}
+            # 子 Agent 如有 tool_calls，简单处理（只跑一轮无递归委托）
+            elif etype == "tool_calls":
+                # 子 Agent 的工具调用：执行后继续一轮 LLM
+                sub_tc = event["tool_calls"]
+                sub_messages.append({"role": "assistant", "content": sub_content, "tool_calls": [
+                    {"id": tc["id"], "type": "function",
+                     "function": {"name": tc["name"],
+                                  "arguments": json.dumps(tc["arguments"], ensure_ascii=False)}}
+                    for tc in sub_tc
+                ]})
+                for tc in sub_tc:
+                    tc_name = tc["name"]
+                    tc_args = tc["arguments"]
+                    # 委托拦截（防递归死循环）
+                    if tc_name in ("delegate", "assign_task"):
+                        sub_messages.append({"role": "tool", "content": '{"error": "子 Agent 不允许递归委托"}', "name": tc_name, "tool_call_id": tc["id"]})
+                        continue
+                    server_config, transport_type = _find_tool_server(session, target.mcp_server_ids, tc_name)
+                    if not server_config:
+                        sub_messages.append({"role": "tool", "content": '{"error": "tool server not found"}', "name": tc_name, "tool_call_id": tc["id"]})
+                        continue
+                    try:
+                        result = await runner.invoke_tool_for_call(target_config, tc_name, tc_args, server_config, transport_type)
+                    except Exception as e:
+                        result = {"error": str(e)}
+                    content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                    sub_messages.append({"role": "tool", "content": content, "name": tc_name, "tool_call_id": tc["id"]})
+                # 继续调 LLM 获取最终结果
+                sub_content = ""
+                async for event2 in runner.call_llm(target_config, target_model_name, sub_messages, sub_tools):
+                    if event2.get("type") == "token":
+                        sub_content += event2["text"]
+                    elif event2.get("type") == "done":
+                        if not sub_content:
+                            sub_content = event2.get("content", "")
+                        break
+                    elif event2.get("type") == "error":
+                        return {"error": f"子 Agent 第二轮失败: {event2['message']}"}
+                break
+    except Exception as e:
+        return {"error": f"子 Agent 执行异常: {e}"}
+
+    # 写子 Agent 的 trace
+    _write_trace(session, conv.id, target.id, -1, "delegation",
+                 input={"supervisor": supervisor_agent.name, "task": task[:200]},
+                 output={"result": sub_content[:500]},
+                 status="ok")
+
+    return {"result": sub_content, "worker": target.name}

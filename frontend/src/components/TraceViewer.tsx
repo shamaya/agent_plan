@@ -28,6 +28,7 @@ const STEP_TYPE_LABEL: Record<Trace['step_type'], string> = {
   retrieval: '检索',
   compression: '上下文压缩',
   constraint_check: '约束检查',
+  routing: '智能路由',
 };
 
 // step_type 颜色
@@ -37,6 +38,7 @@ const STEP_TYPE_COLOR: Record<Trace['step_type'], string> = {
   retrieval: '#722ed1',
   compression: '#fa8c16',
   constraint_check: '#13c2c2',
+  routing: '#2f54eb',
 };
 
 interface TraceViewerProps {

@@ -12,6 +12,7 @@ const STEP_TYPE_LABEL: Record<Trace['step_type'], string> = {
   retrieval: '检索',
   compression: '上下文压缩',
   constraint_check: '约束检查',
+  routing: '智能路由',
 };
 
 export default function Dashboard() {

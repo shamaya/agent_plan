@@ -22,4 +22,17 @@ class Agent(SQLModel, table=True):
         default_factory=lambda: {"top_k": 4},
         sa_column=Column(JSON),
     )
+    approval_config: dict[str, Any] = Field(
+        default_factory=lambda: {"enabled": False, "tools": []},
+        sa_column=Column(JSON),
+    )
+    routing_config: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enabled": False,
+            "simple_model_id": None,
+            "complex_model_id": None,
+            "threshold": 0.5,
+        },
+        sa_column=Column(JSON),
+    )
     created_at: datetime = Field(default_factory=datetime.utcnow)

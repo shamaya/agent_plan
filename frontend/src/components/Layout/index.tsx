@@ -13,6 +13,11 @@ import {
   LineChartOutlined,
   SafetyCertificateOutlined,
   KeyOutlined,
+  TeamOutlined,
+  BulbOutlined,
+  ApartmentOutlined,
+  AuditOutlined,
+  AppstoreOutlined,
 } from '@ant-design/icons';
 
 const { Sider, Header, Content } = AntLayout;
@@ -25,6 +30,12 @@ const menuItems = [
   { key: '/mcp', icon: <ClusterOutlined />, label: 'MCP 服务' },
   { key: '/knowledge', icon: <BookOutlined />, label: '知识库' },
   { key: '/agents', icon: <RobotOutlined />, label: 'Agent' },
+  { key: '/collaboration', icon: <TeamOutlined />, label: '多智能体协同' },
+  { key: '/memory', icon: <BulbOutlined />, label: '长期记忆' },
+  { key: '/workflows', icon: <ApartmentOutlined />, label: 'DAG 工作流' },
+  { key: '/evaluations', icon: <AuditOutlined />, label: '评估框架' },
+  { key: '/guardrails', icon: <SafetyCertificateOutlined />, label: 'Guardrails' },
+  { key: '/prompt-templates', icon: <AppstoreOutlined />, label: 'Prompt 模板' },
   { key: '/chat', icon: <MessageOutlined />, label: '对话' },
   { key: '/traces', icon: <LineChartOutlined />, label: '监控 Trace' },
   { key: '/harness', icon: <SafetyCertificateOutlined />, label: 'Harness 工程' },

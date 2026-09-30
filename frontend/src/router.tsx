@@ -15,6 +15,12 @@ const Traces = lazy(() => import('./pages/Traces'));
 const TraceDetail = lazy(() => import('./pages/TraceDetail'));
 const Harness = lazy(() => import('./pages/Harness'));
 const ApiKeys = lazy(() => import('./pages/ApiKeys'));
+const Collaboration = lazy(() => import('./pages/Collaboration'));
+const Memory = lazy(() => import('./pages/Memory'));
+const Workflows = lazy(() => import('./pages/Workflows'));
+const Evaluations = lazy(() => import('./pages/Evaluations'));
+const Guardrails = lazy(() => import('./pages/Guardrails'));
+const PromptTemplates = lazy(() => import('./pages/PromptTemplates'));
 
 export function AppRoutes() {
   return (
@@ -28,6 +34,12 @@ export function AppRoutes() {
       <Route path="/agents" element={<Agents />} />
       <Route path="/agents/new" element={<AgentEditor />} />
       <Route path="/agents/:id/edit" element={<AgentEditor />} />
+      <Route path="/collaboration" element={<Collaboration />} />
+      <Route path="/memory" element={<Memory />} />
+      <Route path="/workflows" element={<Workflows />} />
+      <Route path="/evaluations" element={<Evaluations />} />
+      <Route path="/guardrails" element={<Guardrails />} />
+      <Route path="/prompt-templates" element={<PromptTemplates />} />
       <Route path="/chat" element={<Chat />} />
       <Route path="/traces" element={<Traces />} />
       <Route path="/traces/:id" element={<TraceDetail />} />

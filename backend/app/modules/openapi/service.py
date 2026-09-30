@@ -97,3 +97,11 @@ async def invoke_webhook(agent: Agent, req: ApiKeyInvoke, conv: Conversation,
 
 def get_task_status(task_id: str) -> dict | None:
     return _tasks.get(task_id)
+
+
+def set_task_status(task_id: str, payload: dict) -> None:
+    """更新任务状态（合并已存在字段，供 A2A 同步路径使用）。"""
+    prev = _tasks.get(task_id, {})
+    prev.update(payload)
+    prev["task_id"] = task_id
+    _tasks[task_id] = prev

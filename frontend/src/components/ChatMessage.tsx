@@ -1,5 +1,5 @@
 import { Typography, Tag, Tooltip } from 'antd';
-import { RobotOutlined, UserOutlined, CompressOutlined } from '@ant-design/icons';
+import { RobotOutlined, UserOutlined, CompressOutlined, StopOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -9,10 +9,12 @@ import ToolCallCard, { type ToolCallView } from './ToolCallCard';
 export interface ChatMessageView {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  images?: string[];
   toolCalls?: { name: string; args: Record<string, unknown>; id?: string }[];
   toolResults?: { name: string; result: unknown }[];
   isCompressedSummary?: boolean;
   streaming?: boolean;
+  interrupted?: boolean;
 }
 
 // 单条消息气泡；assistant 内嵌工具调用卡片
@@ -84,9 +86,22 @@ export default function ChatMessage({ msg }: { msg: ChatMessageView }) {
       <div className={avatarClass}>{icon}</div>
       <div style={{ maxWidth: '76%' }}>
         <div style={{ marginBottom: 4, color: 'var(--muted)', fontSize: 12, textAlign: isUser ? 'right' : 'left' }}>
-          {isUser ? '我' : msg.streaming ? 'Assistant（生成中）' : 'Assistant'}
+          {isUser ? '我' : msg.streaming ? 'Assistant（生成中）' : msg.interrupted ? 'Assistant（已中断）' : 'Assistant'}
         </div>
         <div className={bubbleClass} style={{ padding: '12px 16px' }}>
+          {msg.images && msg.images.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: msg.content ? 8 : 0 }}>
+              {msg.images.map((src, i) => (
+                <img
+                  key={i}
+                  src={src}
+                  alt={`image-${i}`}
+                  style={{ maxWidth: 200, maxHeight: 200, borderRadius: 8, objectFit: 'cover', cursor: 'pointer' }}
+                  onClick={() => window.open(src, '_blank')}
+                />
+              ))}
+            </div>
+          )}
           {msg.streaming && !msg.content && toolViews.length === 0 && (
             <Typography.Text type="secondary">思考中…</Typography.Text>
           )}
@@ -104,6 +119,11 @@ export default function ChatMessage({ msg }: { msg: ChatMessageView }) {
             )
           )}
           {msg.streaming && <span className="cursor-blink">▋</span>}
+          {msg.interrupted && (
+            <Tag icon={<StopOutlined />} color="warning" style={{ marginTop: 6 }}>
+              已中断
+            </Tag>
+          )}
           {toolViews.map((t, i) => (
             <ToolCallCard key={t.id || i} call={t} />
           ))}
